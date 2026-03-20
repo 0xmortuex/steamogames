@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SteamOgames — Live Steam Player Stats</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+<!-- Top gradient accent -->
+<div class="top-accent"></div>
+
+<!-- Header -->
+<header class="header">
+    <div class="container">
+        <div class="header-left">
+            <h1 class="logo">Steam<span class="logo-accent">O</span>games</h1>
+            <span class="tagline">Live Player Statistics</span>
+        </div>
+        <div class="header-right">
+            <div class="search-box">
+                <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+                <input type="text" id="searchInput" placeholder="Search games..." autocomplete="off">
+                <div id="searchResults" class="search-results"></div>
+            </div>
+        </div>
+    </div>
+</header>
+
+<!-- Stats Bar -->
+<section class="stats-bar">
+    <div class="container stats-grid">
+        <div class="stat-card glass">
+            <div class="stat-label">Total Players Online</div>
+            <div class="stat-value" id="totalPlayers">—</div>
+        </div>
+        <div class="stat-card glass">
+            <div class="stat-label">Games Tracked</div>
+            <div class="stat-value" id="trackedGames">—</div>
+        </div>
+        <div class="stat-card glass">
+            <div class="stat-label">Last Updated</div>
+            <div class="stat-value stat-time" id="lastUpdated">—</div>
+        </div>
+    </div>
+</section>
+
+<!-- Main Table -->
+<main class="container main-content">
+    <div class="table-wrapper">
+        <table class="game-table" id="gameTable">
+            <thead>
+                <tr>
+                    <th class="col-rank">#</th>
+                    <th class="col-game">Game</th>
+                    <th class="col-players sortable" data-sort="current_players">
+                        Current Players <span class="sort-arrow">▼</span>
+                    </th>
+                    <th class="col-peak sortable" data-sort="peak_24h">24h Peak</th>
+                    <th class="col-alltime sortable" data-sort="all_time_peak">All-Time Peak</th>
+                    <th class="col-trend sortable" data-sort="trend">Trend</th>
+                    <th class="col-sparkline">24h</th>
+                </tr>
+            </thead>
+            <tbody id="gameTableBody">
+                <tr class="loading-row">
+                    <td colspan="7">
+                        <div class="loader"></div>
+                        <span>Loading games from Steam...</span>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</main>
+
+<!-- Game Detail Modal -->
+<div class="modal-overlay" id="modalOverlay">
+    <div class="modal" id="gameModal">
+        <button class="modal-close" id="modalClose">&times;</button>
+        <div class="modal-header">
+            <img id="modalHeaderImage" src="" alt="">
+        </div>
+        <div class="modal-body">
+            <h2 id="modalGameName"></h2>
+            <div class="modal-stats">
+                <div class="modal-stat">
+                    <span class="modal-stat-label">Current Players</span>
+                    <span class="modal-stat-value" id="modalCurrentPlayers">—</span>
+                </div>
+                <div class="modal-stat">
+                    <span class="modal-stat-label">24h Peak</span>
+                    <span class="modal-stat-value" id="modalPeak24h">—</span>
+                </div>
+                <div class="modal-stat">
+                    <span class="modal-stat-label">All-Time Peak</span>
+                    <span class="modal-stat-value" id="modalAllTimePeak">—</span>
+                </div>
+            </div>
+            <div class="chart-controls">
+                <button class="chart-btn active" data-hours="24">24h</button>
+                <button class="chart-btn" data-hours="168">7d</button>
+                <button class="chart-btn" data-hours="720">30d</button>
+            </div>
+            <div class="chart-container">
+                <canvas id="playerChart"></canvas>
+            </div>
+            <a id="modalStoreLink" href="#" target="_blank" class="store-link">
+                View on Steam Store →
+            </a>
+        </div>
+    </div>
+</div>
+
+<!-- Footer -->
+<footer class="footer">
+    <div class="container">
+        <p>SteamOgames &mdash; Data sourced from the Steam Web API. Not affiliated with Valve.</p>
+    </div>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script src="/static/js/app.js"></script>
+</body>
+</html>
