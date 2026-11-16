@@ -360,6 +360,8 @@ def test_tracked_game_count(ago):
 def test_cleanup_deletes_only_samples_older_than_cutoff(ago):
     add_game(10, "Game", [(1, ago(days=100)), (2, ago(days=80)), (3, ago(hours=1))])
 
-    db.cleanup_old_data(days=90)
+    deleted = db.cleanup_old_data(days=90)
 
+    assert deleted == 1
     assert [h["current_players"] for h in db.get_player_history(10, hours=24 * 365)] == [2, 3]
+    assert db.cleanup_old_data(days=90) == 0

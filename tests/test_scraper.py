@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import datetime
 
 import pytest
 
@@ -65,6 +66,7 @@ def steam(monkeypatch):
     monkeypatch.setattr(scraper, "_pause", fake.pauses.append)
     monkeypatch.setattr(scraper, "_details_retry_at", {})
     monkeypatch.setattr(scraper, "_status", dict.fromkeys(scraper._status))
+    monkeypatch.setattr(scraper, "_last_prune", None)
     return fake
 
 
@@ -390,3 +392,62 @@ def test_crash_is_recorded_and_raised(steam, monkeypatch):
     assert status["running"] is False
     assert status["last_finished"] is not None
     assert status["error"] == "The scrape cycle crashed (OperationalError: database or disk is full)."
+
+
+def sample_ages_in_days(appid):
+    now = db.utcnow()
+    history = db.get_player_history(appid, hours=24 * 3650)
+    return [round((now - datetime.fromisoformat(h["timestamp"])).total_seconds() / 86400) for h in history]
+
+
+def test_history_is_never_deleted_unless_a_limit_is_set(steam, ago):
+    db.upsert_game(10, "Ten")
+    db.insert_player_count(10, 1, ago(days=400))
+    steam.counts = {10: 500, 20: 30}
+
+    assert scraper.HISTORY_DAYS is None
+    scraper.scrape_once()
+
+    assert sample_ages_in_days(10) == [400, 0]
+
+
+def test_history_older_than_the_limit_is_deleted_once_a_day(steam, ago, monkeypatch):
+    monkeypatch.setattr(scraper, "HISTORY_DAYS", 90)
+    db.upsert_game(10, "Ten")
+    db.insert_player_count(10, 900, ago(days=400))
+    db.insert_player_count(10, 2, ago(days=80))
+    db.upsert_peaks(10, 900, 900)
+    steam.counts = {10: 500, 20: 30}
+
+    scraper.scrape_once()
+
+    assert sample_ages_in_days(10) == [80, 0]
+    assert db.get_game_detail(10)["all_time_peak"] == 900  # peaks outlive the samples
+
+    # A second cycle on the same day does not scan for old samples again...
+    db.insert_player_count(10, 3, ago(days=300))
+    scraper.scrape_once()
+    assert sample_ages_in_days(10) == [300, 80, 0, 0]
+
+    # ...the first cycle after a day has passed does.
+    monkeypatch.setattr(scraper, "_last_prune", scraper.time.monotonic() - scraper.PRUNE_INTERVAL_SECONDS - 1)
+    scraper.scrape_once()
+    assert sample_ages_in_days(10) == [80, 0, 0, 0]
+
+
+@pytest.mark.parametrize("value, expected", [(None, None), ("", None), ("  ", None), ("90", 90), (" 30 ", 30), ("365", 365)])
+def test_history_days_setting(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("HISTORY_DAYS", raising=False)
+    else:
+        monkeypatch.setenv("HISTORY_DAYS", value)
+
+    assert scraper.read_history_days() == expected
+
+
+@pytest.mark.parametrize("value", ["abc", "90 days", "12.5", "0", "-1", "29"])
+def test_unusable_history_days_setting_is_an_error(monkeypatch, value):
+    monkeypatch.setenv("HISTORY_DAYS", value)
+
+    with pytest.raises(ValueError, match="HISTORY_DAYS must be"):
+        scraper.read_history_days()

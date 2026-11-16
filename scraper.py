@@ -1,3 +1,4 @@
+import os
 import time
 import logging
 import threading
@@ -36,6 +37,38 @@ DETAILS_RETRY_SECONDS = 60 * 60
 # After this many connection-level failures in a row, Steam or the network is
 # down: stop the pass instead of waiting out REQUEST_TIMEOUT for every game.
 MAX_CONSECUTIVE_FAILURES = 5
+
+# The dashboard's longest chart covers 30 days, so less history than that
+# would quietly break it.
+MIN_HISTORY_DAYS = 30
+
+
+def read_history_days():
+    """How many days of samples to keep, from the HISTORY_DAYS environment variable.
+
+    Returns None when it is not set: nothing is ever deleted, which is how the
+    app has always behaved. Raises ValueError for anything that is not a whole
+    number of at least MIN_HISTORY_DAYS days, because guessing here would mean
+    deleting history the user wanted to keep.
+    """
+    raw = os.getenv("HISTORY_DAYS", "").strip()
+    if not raw:
+        return None
+    try:
+        days = int(raw)
+    except ValueError:
+        raise ValueError(f"HISTORY_DAYS must be a whole number of days, not {raw!r}") from None
+    if days < MIN_HISTORY_DAYS:
+        raise ValueError(
+            f"HISTORY_DAYS must be at least {MIN_HISTORY_DAYS} (the 30-day chart needs that much), not {days}"
+        )
+    return days
+
+
+# Read once at startup so a bad value stops the app instead of being noticed
+# (or not) at the first cleanup.
+HISTORY_DAYS = read_history_days()
+PRUNE_INTERVAL_SECONDS = 24 * 60 * 60
 
 # 120+ popular Steam app IDs (no API key needed to query these).
 # These are always tracked. Whatever is in Steam's live top-100 chart is tracked
@@ -313,6 +346,9 @@ _status = {
 # appid -> time.monotonic() value before which the store is not asked about it again.
 _details_retry_at = {}
 
+# time.monotonic() of the last history cleanup in this process, or None.
+_last_prune = None
+
 
 def get_status():
     """State of the scraper in this process, for the dashboard.
@@ -388,6 +424,9 @@ def _run_cycle():
     # 3. Names and artwork for games seen for the first time.
     _scrape_missing_details(counts, problems)
 
+    # 4. Old samples, if the user asked for a limit (HISTORY_DAYS).
+    _prune_history_if_due()
+
     total = len(counts.keys() | set(tracked))
     log.info("Scrape cycle complete. Got player counts for %d / %d games.", len(counts), total)
     return {
@@ -395,6 +434,22 @@ def _run_cycle():
         "games_failed": total - len(counts),
         "error": " ".join(problems) or None,
     }
+
+
+def _prune_history_if_due():
+    """Once a day, delete samples older than HISTORY_DAYS. Does nothing unless it is set.
+
+    It runs as part of a cycle rather than as its own scheduled job so that it
+    never writes to the database at the same time as the scraper.
+    """
+    global _last_prune
+    if HISTORY_DAYS is None:
+        return
+    if _last_prune is not None and time.monotonic() - _last_prune < PRUNE_INTERVAL_SECONDS:
+        return
+    deleted = db.cleanup_old_data(HISTORY_DAYS)
+    _last_prune = time.monotonic()
+    log.info("Deleted %d samples older than %d days (HISTORY_DAYS).", deleted, HISTORY_DAYS)
 
 
 def _scrape_player_counts(appids, now, problems):

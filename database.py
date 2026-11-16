@@ -415,8 +415,10 @@ def get_latest_sample_time():
 
 
 def cleanup_old_data(days=90):
+    """Delete samples older than `days` days and return how many were removed.
+
+    Peaks are kept in their own table, so all-time peaks survive the cleanup.
+    """
     cutoff = (utcnow() - timedelta(days=days)).isoformat()
-    conn = get_connection()
-    conn.execute("DELETE FROM player_counts WHERE timestamp < ?", (cutoff,))
-    conn.commit()
-    conn.close()
+    with closing(get_connection()) as conn, conn:
+        return conn.execute("DELETE FROM player_counts WHERE timestamp < ?", (cutoff,)).rowcount

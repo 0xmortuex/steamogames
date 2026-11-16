@@ -12,6 +12,8 @@ import pytest
 
 # Must be set before `app` is imported anywhere.
 os.environ["SCRAPER_ENABLED"] = "0"
+# Tests must not pick up the retention setting of the machine they run on.
+os.environ.pop("HISTORY_DAYS", None)
 
 import database  # noqa: E402
 
