@@ -278,6 +278,19 @@ def get_game_detail(appid):
     return dict(row) if row else None
 
 
+def get_latest_sample(appid):
+    """The game's newest sample as {"current_players", "timestamp"}, or None if it has none."""
+    with closing(get_connection()) as conn:
+        row = conn.execute("""
+            SELECT current_players, timestamp
+            FROM player_counts
+            WHERE appid = ?
+            ORDER BY timestamp DESC, id DESC
+            LIMIT 1
+        """, (appid,)).fetchone()
+    return dict(row) if row else None
+
+
 def get_player_history(appid, hours=24):
     since = (utcnow() - timedelta(hours=hours)).isoformat()
     conn = get_connection()
@@ -302,8 +315,11 @@ def _sparkline(conn, appid, points):
     values = [r["current_players"] for r in rows]
     if len(values) <= points:
         return values
-    step = len(values) / points
-    return [values[int(i * step)] for i in range(points)]
+    # Pick `points` samples spread evenly from the oldest to the newest. The
+    # newest one must be among them: the sparkline ends at "now" and its colour
+    # compares that last point with the first.
+    last = len(values) - 1
+    return [values[round(i * last / (points - 1))] for i in range(points)]
 
 
 def _player_count_yesterday(conn, appid):
@@ -347,6 +363,8 @@ def get_trend_data(appids, points=24):
 
 def search_games(query, limit=20):
     """Live games whose name contains `query`, most played first."""
+    # % and _ are LIKE wildcards; escape them so they only match themselves.
+    escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     with closing(get_connection()) as conn:
         live_since = _live_since(conn)
         if live_since is None:
@@ -356,10 +374,10 @@ def search_games(query, limit=20):
                    pc.current_players
             FROM games g
             JOIN player_counts pc ON pc.id = {_LIVE_SAMPLE_ID}
-            WHERE g.name LIKE :pattern
+            WHERE g.name LIKE :pattern ESCAPE '\\'
             ORDER BY pc.current_players DESC, g.appid
             LIMIT :limit
-        """, {"live_since": live_since, "pattern": f"%{query}%", "limit": limit}).fetchall()
+        """, {"live_since": live_since, "pattern": f"%{escaped}%", "limit": limit}).fetchall()
     return [dict(r) for r in rows]
 
 

@@ -94,6 +94,71 @@ def test_top_honours_limit(client, ago):
     assert [g["appid"] for g in data["games"]] == [3, 2]
 
 
+def test_top_limit_is_kept_between_1_and_200(client, ago):
+    appids = list(range(1, 206))
+    db.ensure_games(appids)
+    db.record_samples([(appid, appid, None) for appid in appids], ago(minutes=1))
+
+    def listed(limit):
+        return len(client.get(f"/api/top?limit={limit}").get_json()["games"])
+
+    assert listed(1000) == 200
+    assert listed(200) == 200
+    assert listed(5) == 5
+    assert listed(0) == 1
+    assert listed(-1) == 1  # SQLite reads a negative LIMIT as "no limit"
+
+
+def test_game_history_range_is_kept_between_1_hour_and_30_days(client, ago):
+    add_game(10, "Game", [(1, ago(days=40)), (2, ago(days=20)), (3, ago(minutes=30))])
+
+    def history(hours):
+        data = client.get(f"/api/game/10?hours={hours}").get_json()
+        return [h["current_players"] for h in data["history"]]
+
+    assert history(100000) == [2, 3]
+    assert history(720) == [2, 3]
+    assert history(0) == [3]
+    assert history(-5) == [3]
+
+
+def test_game_current_players_is_the_newest_sample_whatever_the_range(client, ago):
+    newest = ago(hours=30)
+    add_game(10, "Game", [(5, ago(hours=50)), (7, newest)])
+
+    data = client.get("/api/game/10?hours=24").get_json()
+
+    assert data["history"] == []
+    assert data["game"]["current_players"] == 7
+    assert data["game"]["updated_at"] == newest
+
+
+def test_game_without_samples_reports_no_count_instead_of_zero(client):
+    add_game(10, "Never scraped")
+
+    game = client.get("/api/game/10").get_json()["game"]
+
+    assert game["current_players"] is None
+    assert game["updated_at"] is None
+
+
+def test_search_treats_wildcard_characters_as_text(client, ago):
+    add_game(10, "100% Orange Juice", [(30, ago(minutes=1))])
+    add_game(20, "Half-Life", [(20, ago(minutes=1))])
+    add_game(30, "A_B Testing", [(10, ago(minutes=1))])
+    add_game(40, "AxB Testing", [(5, ago(minutes=1))])
+
+    def found(query):
+        results = client.get("/api/search", query_string={"q": query}).get_json()["results"]
+        return [r["appid"] for r in results]
+
+    assert found("%%") == []
+    assert found("0%") == [10]
+    assert found("a_b") == [30]
+    assert found("__") == []
+    assert found("lf-l") == [20]
+
+
 def test_game_detail_returns_stats_and_history(client, ago):
     add_game(10, "Game", [(5, ago(hours=30)), (7, ago(hours=2)), (9, ago(minutes=1))])
     db.upsert_peaks(10, 9, 12)

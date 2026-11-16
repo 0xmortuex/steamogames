@@ -235,6 +235,27 @@ def test_sparkline_is_downsampled_to_24_points(ago):
     assert sparkline == sorted(sparkline)
 
 
+def test_sparkline_ends_at_the_newest_sample(ago):
+    # A full day of 5-minute samples, as the scraper produces.
+    samples = [(i, ago(minutes=5 * (287 - i))) for i in range(288)]
+    add_game(10, "Game", samples)
+
+    sparkline = db.get_sparkline_data(10)
+
+    assert len(sparkline) == 24
+    assert sparkline[-1] == 287
+    assert sparkline == sorted(set(sparkline))
+
+
+def test_latest_sample_of_a_game(ago):
+    newest = ago(hours=30)
+    add_game(10, "Game", [(5, ago(hours=50)), (7, newest)])
+    db.upsert_game(20, "Never scraped")
+
+    assert db.get_latest_sample(10) == {"current_players": 7, "timestamp": newest}
+    assert db.get_latest_sample(20) is None
+
+
 def test_sparkline_returns_all_points_when_there_are_few(ago):
     add_game(10, "Game", [(5, ago(hours=2)), (7, ago(hours=1)), (99, ago(hours=30))])
 

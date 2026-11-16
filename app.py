@@ -45,7 +45,7 @@ def index():
 @app.route("/api/top")
 def api_top():
     limit = request.args.get("limit", 100, type=int)
-    limit = min(limit, 200)
+    limit = max(1, min(limit, 200))  # SQLite treats a negative LIMIT as "no limit"
     games = db.get_top_games(limit)
 
     # Attach trend and sparkline data
@@ -79,14 +79,15 @@ def api_game(appid):
         return jsonify({"error": "Game not found"}), 404
 
     hours = request.args.get("hours", 24, type=int)
-    hours = min(hours, 720)  # Max 30 days
+    hours = max(1, min(hours, 720))  # 1 hour to 30 days
     history = db.get_player_history(appid, hours)
 
-    # Get current players from latest record
-    if history:
-        game["current_players"] = history[-1]["current_players"]
-    else:
-        game["current_players"] = 0
+    # Current players is the game's newest sample, whether or not it falls in
+    # the requested range. A game that was never sampled has no count (null),
+    # which is not the same as zero players.
+    latest = db.get_latest_sample(appid)
+    game["current_players"] = latest["current_players"] if latest else None
+    game["updated_at"] = latest["timestamp"] if latest else None
 
     return jsonify({
         "game": game,
