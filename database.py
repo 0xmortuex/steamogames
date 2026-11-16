@@ -146,6 +146,19 @@ def get_player_history(appid, hours=24):
     return [dict(r) for r in rows]
 
 
+def get_peak_players(appid, hours=24):
+    """Highest sampled player count in the last `hours` hours, or None if there are no samples."""
+    since = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+    conn = get_connection()
+    row = conn.execute("""
+        SELECT MAX(current_players) AS peak
+        FROM player_counts
+        WHERE appid = ? AND timestamp >= ?
+    """, (appid, since)).fetchone()
+    conn.close()
+    return row["peak"]
+
+
 def get_sparkline_data(appid, points=24):
     since = (datetime.utcnow() - timedelta(hours=24)).isoformat()
     conn = get_connection()

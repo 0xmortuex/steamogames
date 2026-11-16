@@ -199,7 +199,11 @@ def scrape_once():
 
         success_count += 1
         db.insert_player_count(appid, current, now)
-        db.upsert_peaks(appid, current, current)
+        # The 24h peak is the highest sample of the last 24 hours (which includes
+        # the one just inserted), not the latest count. upsert_peaks() only ever
+        # raises the all-time peak, so passing the 24h peak for both is correct.
+        peak_24h = db.get_peak_players(appid, hours=24)
+        db.upsert_peaks(appid, peak_24h, peak_24h)
 
         existing = db.get_game_detail(appid)
         if not existing or not existing.get("name") or existing["name"] == f"App {appid}":

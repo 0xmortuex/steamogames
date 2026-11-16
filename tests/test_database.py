@@ -65,6 +65,20 @@ def test_player_history_only_returns_requested_window_oldest_first(ago):
     assert db.get_player_history(10, hours=48)[0]["current_players"] == 1
 
 
+def test_peak_players_is_the_maximum_within_the_window(ago):
+    add_game(10, "Game", [(900, ago(hours=30)), (300, ago(hours=20)), (200, ago(minutes=5))])
+
+    assert db.get_peak_players(10, hours=24) == 300
+    assert db.get_peak_players(10, hours=48) == 900
+    assert db.get_peak_players(10, hours=1) == 200
+
+
+def test_peak_players_is_none_without_samples_in_window(ago):
+    add_game(10, "Game", [(900, ago(hours=30))])
+
+    assert db.get_peak_players(10, hours=24) is None
+
+
 def test_sparkline_is_downsampled_to_24_points(ago):
     samples = [(i, ago(minutes=5 * (100 - i))) for i in range(100)]
     add_game(10, "Game", samples)
