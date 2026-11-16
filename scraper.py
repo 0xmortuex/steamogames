@@ -34,6 +34,12 @@ DETAILS_DELAY = 1.5
 # (instead of once per cycle, forever).
 DETAILS_RETRY_SECONDS = 60 * 60
 
+# No name lookup is started later than this many seconds into a cycle, so that a
+# cycle always ends before the next one is due; the games left over are looked
+# up in the following cycles. Only a new database has enough unnamed games
+# (~180, about 5 minutes of lookups) to get here.
+DETAILS_CUTOFF_SECONDS = 4 * 60
+
 # After this many connection-level failures in a row, Steam or the network is
 # down: stop the pass instead of waiting out REQUEST_TIMEOUT for every game.
 MAX_CONSECUTIVE_FAILURES = 5
@@ -343,10 +349,10 @@ _status = {
     "error": None,
 }
 
-# appid -> time.monotonic() value before which the store is not asked about it again.
+# appid -> _clock() value before which the store is not asked about it again.
 _details_retry_at = {}
 
-# time.monotonic() of the last history cleanup in this process, or None.
+# _clock() value of the last history cleanup in this process, or None.
 _last_prune = None
 
 
@@ -366,6 +372,11 @@ def get_status():
 
 def _pause(seconds):
     time.sleep(seconds)
+
+
+def _clock():
+    """Seconds on a clock that only moves forward, for measuring intervals."""
+    return time.monotonic()
 
 
 def scrape_once():
@@ -393,6 +404,7 @@ def scrape_once():
 
 def _run_cycle():
     log.info("Starting scrape cycle...")
+    cycle_started = _clock()
     now = db.utcnow().isoformat()
     problems = []
     counts = {}
@@ -422,7 +434,7 @@ def _run_cycle():
     counts.update(_scrape_player_counts(others, now, problems))
 
     # 3. Names and artwork for games seen for the first time.
-    _scrape_missing_details(counts, problems)
+    _scrape_missing_details(counts, problems, cycle_started + DETAILS_CUTOFF_SECONDS)
 
     # 4. Old samples, if the user asked for a limit (HISTORY_DAYS).
     _prune_history_if_due()
@@ -445,10 +457,10 @@ def _prune_history_if_due():
     global _last_prune
     if HISTORY_DAYS is None:
         return
-    if _last_prune is not None and time.monotonic() - _last_prune < PRUNE_INTERVAL_SECONDS:
+    if _last_prune is not None and _clock() - _last_prune < PRUNE_INTERVAL_SECONDS:
         return
     deleted = db.cleanup_old_data(HISTORY_DAYS)
-    _last_prune = time.monotonic()
+    _last_prune = _clock()
     log.info("Deleted %d samples older than %d days (HISTORY_DAYS).", deleted, HISTORY_DAYS)
 
 
@@ -500,20 +512,21 @@ def _scrape_player_counts(appids, now, problems):
     return counts
 
 
-def _scrape_missing_details(counts, problems):
+def _scrape_missing_details(counts, problems, cutoff):
     """Look up name and artwork for sampled games that only have a placeholder name.
 
     `counts` is {appid: current players}; the most played games are looked up
     first because they are at the top of the dashboard. The store API is slow
-    (one request every DETAILS_DELAY seconds), so on a fresh database this pass
-    takes a few minutes.
+    (one request every DETAILS_DELAY seconds), so no lookup is started once the
+    clock has passed `cutoff`; the rest follows in the next cycle.
     """
+    now = _clock()
     pending = []
     for appid in sorted(counts, key=counts.get, reverse=True):
         existing = db.get_game_detail(appid)
         if existing and existing.get("name") and existing["name"] != db.placeholder_name(appid):
             continue
-        if _details_retry_at.get(appid, 0) > time.monotonic():
+        if _details_retry_at.get(appid, 0) > now:
             continue
         pending.append(appid)
 
@@ -521,6 +534,12 @@ def _scrape_missing_details(counts, problems):
     consecutive_failures = 0
 
     for position, appid in enumerate(pending):
+        if _clock() > cutoff:
+            log.info(
+                "Out of time for detail lookups in this cycle; the remaining %d games follow in the next cycles.",
+                len(pending) - position,
+            )
+            break
         if position:
             _pause(DETAILS_DELAY)
 
@@ -554,7 +573,7 @@ def _scrape_missing_details(counts, problems):
                 "The Steam store has no page for appid %s; not asking again for %d minutes.",
                 appid, DETAILS_RETRY_SECONDS // 60,
             )
-            _details_retry_at[appid] = time.monotonic() + DETAILS_RETRY_SECONDS
+            _details_retry_at[appid] = _clock() + DETAILS_RETRY_SECONDS
             continue
 
         db.upsert_game(

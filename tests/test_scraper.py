@@ -294,6 +294,31 @@ def test_details_are_fetched_for_the_most_played_games_first(steam, monkeypatch)
     assert steam.requested("details") == [20, 30, 10]
 
 
+def test_detail_lookups_stop_at_the_cycle_cutoff_and_continue_next_cycle(steam, monkeypatch):
+    monkeypatch.setattr(scraper, "TRACKED_APPIDS", [10, 20, 30, 40])
+    steam.counts = {10: 400, 20: 300, 30: 200, 40: 100}
+    steam.details = {appid: details(f"Game {appid}") for appid in (10, 20, 30, 40)}
+    # A clock that only advances when the scraper pauses between requests.
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(scraper, "_clock", lambda: clock["now"])
+    monkeypatch.setattr(scraper, "_pause", lambda seconds: clock.update(now=clock["now"] + seconds))
+    # The four count requests take three pauses. After them there is time for
+    # three lookups (0s, 1.5s and 3s into the pass) but not for a fourth.
+    count_pass = 3 * scraper.PLAYER_COUNT_DELAY
+    monkeypatch.setattr(scraper, "DETAILS_CUTOFF_SECONDS", count_pass + 2 * scraper.DETAILS_DELAY - 0.1)
+
+    summary = scraper.scrape_once()
+
+    assert steam.requested("details") == [10, 20, 30]
+    assert db.get_game_detail(40)["name"] == "App 40"
+    assert summary == {"games_ok": 4, "games_failed": 0, "error": None}
+
+    scraper.scrape_once()
+
+    assert steam.requested("details") == [10, 20, 30, 40]
+    assert db.get_game_detail(40)["name"] == "Game 40"
+
+
 def test_named_games_are_not_looked_up_again(steam):
     steam.counts = {10: 500, 20: 30}
     steam.details = {10: details("Ten"), 20: details("Twenty")}
@@ -430,7 +455,7 @@ def test_history_older_than_the_limit_is_deleted_once_a_day(steam, ago, monkeypa
     assert sample_ages_in_days(10) == [300, 80, 0, 0]
 
     # ...the first cycle after a day has passed does.
-    monkeypatch.setattr(scraper, "_last_prune", scraper.time.monotonic() - scraper.PRUNE_INTERVAL_SECONDS - 1)
+    monkeypatch.setattr(scraper, "_last_prune", scraper._clock() - scraper.PRUNE_INTERVAL_SECONDS - 1)
     scraper.scrape_once()
     assert sample_ages_in_days(10) == [80, 0, 0, 0]
 
