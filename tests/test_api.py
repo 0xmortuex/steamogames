@@ -52,6 +52,17 @@ def test_top_reports_when_the_data_was_last_refreshed(client, ago):
     assert client.get("/api/top").get_json()["updated_at"] == newest
 
 
+def test_top_reports_the_server_clock_in_the_same_format_as_the_data(client, ago):
+    from datetime import datetime
+
+    add_game(10, "A", [(1, ago(minutes=20))])
+
+    data = client.get("/api/top").get_json()
+
+    age = datetime.fromisoformat(data["server_time"]) - datetime.fromisoformat(data["updated_at"])
+    assert 20 * 60 <= age.total_seconds() < 20 * 60 + 30
+
+
 def test_top_includes_the_scraper_status(client, monkeypatch):
     import scraper
 

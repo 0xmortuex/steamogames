@@ -64,7 +64,10 @@ def api_top():
         "total_players": db.get_total_players(),
         "tracked_count": db.get_tracked_game_count(),
         # When the data was last refreshed (UTC), as opposed to when it was fetched.
+        # server_time lets the page work out the data's age without trusting
+        # the clock of the device it runs on.
         "updated_at": db.get_latest_sample_time(),
+        "server_time": db.utcnow().isoformat(),
         "scraper": {"enabled": SCRAPER_ENABLED, **scraper.get_status()},
     })
 

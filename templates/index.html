@@ -50,18 +50,23 @@
 
 <!-- Main Table -->
 <main class="container main-content">
+    <!-- Problems with the data (failed refresh, old data, scraper errors); hidden when there are none -->
+    <div class="status-banner" id="statusBanner" role="status" hidden></div>
     <div class="table-wrapper">
         <table class="game-table" id="gameTable">
             <thead>
                 <tr>
                     <th class="col-rank">#</th>
                     <th class="col-game">Game</th>
-                    <th class="col-players sortable" data-sort="current_players">
+                    <th class="col-players sortable active" data-sort="current_players">
                         Current Players <span class="sort-arrow">▼</span>
                     </th>
-                    <th class="col-peak sortable" data-sort="peak_24h">24h Peak</th>
-                    <th class="col-alltime sortable" data-sort="all_time_peak">All-Time Peak</th>
-                    <th class="col-trend sortable" data-sort="trend">Trend</th>
+                    <th class="col-peak sortable" data-sort="peak_24h"
+                        title="Highest player count of the last 24 hours">24h Peak <span class="sort-arrow"></span></th>
+                    <th class="col-alltime sortable" data-sort="all_time_peak"
+                        title="Highest player count recorded since this dashboard started tracking the game">All-Time Peak <span class="sort-arrow"></span></th>
+                    <th class="col-trend sortable" data-sort="trend"
+                        title="Current players compared with the same time yesterday">Trend <span class="sort-arrow"></span></th>
                     <th class="col-sparkline">24h</th>
                 </tr>
             </thead>
@@ -107,6 +112,7 @@
             </div>
             <div class="chart-container">
                 <canvas id="playerChart"></canvas>
+                <div class="chart-message" id="chartMessage" hidden></div>
             </div>
             <a id="modalStoreLink" href="#" target="_blank" class="store-link">
                 View on Steam Store →
