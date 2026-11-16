@@ -189,6 +189,12 @@ body {
     color: var(--accent);
 }
 
+.search-result-message {
+    padding: 12px 14px;
+    font-size: 0.85rem;
+    color: var(--text-dim);
+}
+
 /* ===== STATS BAR ===== */
 .stats-bar {
     padding: 24px 0;
@@ -232,6 +238,29 @@ body {
 .stat-time {
     font-size: 1rem;
     color: var(--text-dim);
+}
+
+/* The newest data is older than it should be */
+.stat-time.stat-stale {
+    color: var(--red);
+}
+
+/* ===== STATUS BANNER ===== */
+.status-banner {
+    margin-bottom: 16px;
+    padding: 12px 16px;
+    background: var(--red-dim);
+    border: 1px solid var(--red);
+    border-radius: var(--radius-sm);
+    font-size: 0.85rem;
+}
+
+.status-banner[hidden] {
+    display: none;
+}
+
+.status-banner p + p {
+    margin-top: 6px;
 }
 
 /* ===== TABLE ===== */
@@ -566,6 +595,24 @@ body {
     padding: 16px;
     margin-bottom: 20px;
     height: 260px;
+    position: relative;
+}
+
+/* Shown in place of the chart: loading, no data, or an error */
+.chart-message {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    text-align: center;
+    font-size: 0.9rem;
+    color: var(--text-muted);
+}
+
+.chart-message[hidden] {
+    display: none;
 }
 
 .store-link {

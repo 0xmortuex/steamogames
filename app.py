@@ -4,12 +4,17 @@ import logging
 from flask import Flask, jsonify, request, render_template
 
 import database as db
+import scraper
 from scraper import scrape_once
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+# The dashboard runs its own scraper thread. Set SCRAPER_ENABLED=0 to serve the
+# dashboard only (tests, or when `python scraper.py` runs as a separate process).
+SCRAPER_ENABLED = os.getenv("SCRAPER_ENABLED", "1") != "0"
 
 # Initialize database
 db.init_db()
@@ -21,13 +26,15 @@ def start_background_scraper():
     log.info("Running initial scrape in background...")
     try:
         scrape_once()
-    except Exception as e:
-        log.error("Initial scrape failed: %s", e)
+    except Exception:
+        # scrape_once() has recorded the failure for the dashboard; keep the
+        # traceback in the log and still start the schedule so scraping resumes.
+        log.exception("Initial scrape failed")
 
     scheduler = BackgroundScheduler()
-    scheduler.add_job(scrape_once, "interval", minutes=5, id="steam_scrape")
+    scheduler.add_job(scrape_once, "interval", minutes=scraper.SCRAPE_INTERVAL_MINUTES, id="steam_scrape")
     scheduler.start()
-    log.info("Background scraper started (every 5 minutes).")
+    log.info("Background scraper started (every %d minutes).", scraper.SCRAPE_INTERVAL_MINUTES)
 
 
 @app.route("/")
@@ -38,23 +45,30 @@ def index():
 @app.route("/api/top")
 def api_top():
     limit = request.args.get("limit", 100, type=int)
-    limit = min(limit, 200)
+    limit = max(1, min(limit, 200))  # SQLite treats a negative LIMIT as "no limit"
     games = db.get_top_games(limit)
 
     # Attach trend and sparkline data
+    trend_data = db.get_trend_data([game["appid"] for game in games])
     for game in games:
-        yesterday = db.get_player_count_yesterday(game["appid"])
+        yesterday = trend_data[game["appid"]]["yesterday"]
         current = game.get("current_players", 0)
         if yesterday and yesterday > 0:
             game["trend"] = round(((current - yesterday) / yesterday) * 100, 1)
         else:
             game["trend"] = None
-        game["sparkline"] = db.get_sparkline_data(game["appid"])
+        game["sparkline"] = trend_data[game["appid"]]["sparkline"]
 
     return jsonify({
         "games": games,
         "total_players": db.get_total_players(),
         "tracked_count": db.get_tracked_game_count(),
+        # When the data was last refreshed (UTC), as opposed to when it was fetched.
+        # server_time lets the page work out the data's age without trusting
+        # the clock of the device it runs on.
+        "updated_at": db.get_latest_sample_time(),
+        "server_time": db.utcnow().isoformat(),
+        "scraper": {"enabled": SCRAPER_ENABLED, **scraper.get_status()},
     })
 
 
@@ -65,14 +79,15 @@ def api_game(appid):
         return jsonify({"error": "Game not found"}), 404
 
     hours = request.args.get("hours", 24, type=int)
-    hours = min(hours, 720)  # Max 30 days
+    hours = max(1, min(hours, 720))  # 1 hour to 30 days
     history = db.get_player_history(appid, hours)
 
-    # Get current players from latest record
-    if history:
-        game["current_players"] = history[-1]["current_players"]
-    else:
-        game["current_players"] = 0
+    # Current players is the game's newest sample, whether or not it falls in
+    # the requested range. A game that was never sampled has no count (null),
+    # which is not the same as zero players.
+    latest = db.get_latest_sample(appid)
+    game["current_players"] = latest["current_players"] if latest else None
+    game["updated_at"] = latest["timestamp"] if latest else None
 
     return jsonify({
         "game": game,
@@ -101,7 +116,8 @@ def ensure_scraper():
         t.start()
 
 
-ensure_scraper()
+if SCRAPER_ENABLED:
+    ensure_scraper()
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
