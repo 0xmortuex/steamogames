@@ -1,3 +1,7 @@
+import sqlite3
+
+import pytest
+
 import database as db
 
 
@@ -83,18 +87,141 @@ def test_player_history_only_returns_requested_window_oldest_first(ago):
     assert db.get_player_history(10, hours=48)[0]["current_players"] == 1
 
 
-def test_peak_players_is_the_maximum_within_the_window(ago):
-    add_game(10, "Game", [(900, ago(hours=30)), (300, ago(hours=20)), (200, ago(minutes=5))])
-
-    assert db.get_peak_players(10, hours=24) == 300
-    assert db.get_peak_players(10, hours=48) == 900
-    assert db.get_peak_players(10, hours=1) == 200
+def peaks(appid):
+    game = db.get_game_detail(appid)
+    return game["peak_24h"], game["all_time_peak"]
 
 
-def test_peak_players_is_none_without_samples_in_window(ago):
-    add_game(10, "Game", [(900, ago(hours=30))])
+def test_record_samples_stores_the_count_and_the_highest_sample_of_24_hours(ago):
+    add_game(10, "Game", [(900, ago(hours=30)), (300, ago(hours=20))])
+    db.upsert_peaks(10, 300, 900)
 
-    assert db.get_peak_players(10, hours=24) is None
+    now = ago()
+    db.record_samples([(10, 200, None)], now)
+
+    assert db.get_top_games()[0]["current_players"] == 200
+    assert db.get_top_games()[0]["timestamp"] == now
+    assert peaks(10) == (300, 900)  # 900 was sampled more than 24h ago
+
+
+def test_record_samples_uses_the_reported_peak_when_it_is_higher(ago):
+    db.upsert_game(10, "New to us")
+    db.upsert_game(20, "Tracked for a while")
+    db.insert_player_count(20, 5000, ago(hours=3))
+
+    db.record_samples([(10, 700, 1300), (20, 4000, 4500)], ago())
+
+    assert peaks(10) == (1300, 1300)
+    assert peaks(20) == (5000, 5000)  # our own sample from 3h ago beats Steam's figure
+
+
+def test_record_samples_is_all_or_nothing(ago):
+    db.upsert_game(10, "Game")
+
+    with pytest.raises(sqlite3.IntegrityError):
+        # 999 is not in the games table: the foreign key rejects it.
+        db.record_samples([(10, 100, None), (999, 5, None)], ago())
+
+    assert db.get_top_games() == []
+    assert peaks(10) == (None, None)
+
+
+def test_record_chart_adds_new_games_and_remembers_when_they_were_charted(ago):
+    db.upsert_game(10, "Known Game", "thumb.jpg", "header.jpg")
+
+    db.record_chart(
+        [
+            {"appid": 10, "current_players": 700, "peak_today": 1300},
+            {"appid": 20, "current_players": 90, "peak_today": 150},
+        ],
+        ago(),
+    )
+
+    top = db.get_top_games()
+    assert [(g["appid"], g["name"], g["current_players"], g["peak_24h"]) for g in top] == [
+        (10, "Known Game", 700, 1300),
+        (20, "App 20", 90, 150),
+    ]
+    assert top[0]["thumbnail_url"] == "thumb.jpg"
+    assert db.get_recently_charted(days=7) == [10, 20]
+
+
+def test_recently_charted_forgets_games_after_the_retention_period(ago):
+    db.record_chart([{"appid": 10, "current_players": 5, "peak_today": 5}], ago(days=8))
+    db.record_chart([{"appid": 20, "current_players": 5, "peak_today": 5}], ago(days=6))
+    db.record_chart([{"appid": 30, "current_players": 5, "peak_today": 5}], ago(minutes=5))
+
+    assert db.get_recently_charted(days=7) == [20, 30]
+
+    db.record_chart([{"appid": 10, "current_players": 6, "peak_today": 6}], ago())
+    assert db.get_recently_charted(days=7) == [10, 20, 30]
+
+
+def test_ensure_games_creates_placeholders_without_touching_known_games():
+    db.upsert_game(10, "Known Game", "thumb.jpg", "header.jpg")
+
+    db.ensure_games([10, 20])
+
+    assert db.get_game_detail(10)["name"] == "Known Game"
+    assert db.get_game_detail(10)["thumbnail_url"] == "thumb.jpg"
+    assert db.get_game_detail(20)["name"] == db.placeholder_name(20) == "App 20"
+
+
+def test_games_that_stopped_being_sampled_are_not_live(ago):
+    add_game(10, "Live", [(100, ago(minutes=40)), (110, ago(minutes=5))])
+    add_game(20, "Missed two cycles", [(50, ago(minutes=14))])
+    add_game(30, "No longer tracked", [(9000, ago(minutes=40))])
+    add_game(40, "Scraped just now", [(7, ago())])
+
+    assert [g["appid"] for g in db.get_top_games()] == [10, 20, 40]
+    assert db.get_total_players() == 167
+    assert db.get_tracked_game_count() == 3
+    assert [g["appid"] for g in db.search_games("tracked")] == []
+    assert [g["appid"] for g in db.search_games("missed")] == [20]
+
+
+def test_last_snapshot_stays_live_while_the_scraper_is_down(ago):
+    # Nothing has been sampled for two days: "live" is measured from the newest
+    # sample, so the last complete snapshot is still served.
+    add_game(10, "A", [(100, ago(days=2, minutes=5))])
+    add_game(20, "B", [(50, ago(days=2))])
+    add_game(30, "Dropped before the outage", [(70, ago(days=2, minutes=30))])
+
+    assert [g["appid"] for g in db.get_top_games()] == [10, 20]
+    assert db.get_total_players() == 150
+    assert db.get_tracked_game_count() == 2
+    assert db.get_latest_sample_time() == db.get_top_games()[1]["timestamp"]
+
+
+def test_init_db_upgrades_a_database_created_by_an_older_version(temp_db, ago):
+    # The schema as it was before the top_chart table existed.
+    temp_db.unlink()
+    conn = sqlite3.connect(temp_db)
+    conn.executescript("""
+        CREATE TABLE games (appid INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                            thumbnail_url TEXT, header_image_url TEXT);
+        CREATE TABLE player_counts (id INTEGER PRIMARY KEY AUTOINCREMENT, appid INTEGER NOT NULL,
+                                    current_players INTEGER NOT NULL, timestamp TEXT NOT NULL,
+                                    FOREIGN KEY (appid) REFERENCES games(appid));
+        CREATE TABLE peaks (appid INTEGER PRIMARY KEY, peak_24h INTEGER DEFAULT 0,
+                            all_time_peak INTEGER DEFAULT 0, last_updated TEXT,
+                            FOREIGN KEY (appid) REFERENCES games(appid));
+        CREATE INDEX idx_player_counts_appid_ts ON player_counts(appid, timestamp);
+    """)
+    conn.execute("INSERT INTO games VALUES (10, 'Old Game', 't.jpg', 'h.jpg')")
+    conn.execute("INSERT INTO player_counts (appid, current_players, timestamp) VALUES (10, 42, ?)",
+                 (ago(minutes=5),))
+    conn.execute("INSERT INTO peaks VALUES (10, 42, 99, ?)", (ago(minutes=5),))
+    conn.commit()
+    conn.close()
+
+    db.init_db()
+
+    top = db.get_top_games()
+    assert [(g["name"], g["current_players"], g["all_time_peak"]) for g in top] == [("Old Game", 42, 99)]
+    assert db.get_recently_charted(days=7) == []
+    db.record_chart([{"appid": 10, "current_players": 50, "peak_today": 60}], ago())
+    assert peaks(10) == (60, 99)
 
 
 def test_sparkline_is_downsampled_to_24_points(ago):
@@ -146,13 +273,19 @@ def test_trend_data_matches_the_single_game_helpers(ago):
         assert trend_data[appid]["sparkline"] == db.get_sparkline_data(appid)
 
 
-def test_search_lists_games_without_samples_last(ago):
+def test_search_only_lists_games_that_have_a_count(ago):
     db.upsert_game(10, "Portal")
     add_game(20, "Portal 2", [(800, ago(minutes=1))])
 
     results = db.search_games("portal")
 
-    assert [(r["appid"], r["current_players"]) for r in results] == [(20, 800), (10, None)]
+    assert [(r["appid"], r["current_players"]) for r in results] == [(20, 800)]
+
+
+def test_search_is_empty_before_the_first_scrape():
+    db.upsert_game(10, "Portal")
+
+    assert db.search_games("portal") == []
 
 
 def test_search_matches_substring_case_insensitively(ago):

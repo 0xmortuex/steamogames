@@ -11,8 +11,18 @@ log = logging.getLogger(__name__)
 REQUEST_TIMEOUT = 10
 SCRAPE_INTERVAL_MINUTES = 5
 
+TOP_CHART_URL = "https://api.steampowered.com/ISteamChartsService/GetGamesByConcurrentPlayers/v1/"
 PLAYER_COUNT_URL = "https://api.steampowered.com/ISteamUserStats/GetNumberOfCurrentPlayers/v1/"
 APP_DETAILS_URL = "https://store.steampowered.com/api/appdetails"
+
+# Steam refreshes its top chart every few minutes. If the copy we receive is
+# older than this, it is treated as unavailable rather than stored as current.
+CHART_MAX_AGE_SECONDS = 30 * 60
+
+# A game that drops out of Steam's top chart (and is not in TRACKED_APPIDS) is
+# still tracked for this long, so a game hovering around rank 100 keeps a
+# continuous history. After that it is no longer requested.
+CHART_RETENTION_DAYS = 7
 
 # Pauses between requests. Steam publishes no limit for keyless calls; the store
 # API is known to block clients that go much above 200 requests per 5 minutes.
@@ -27,7 +37,10 @@ DETAILS_RETRY_SECONDS = 60 * 60
 # down: stop the pass instead of waiting out REQUEST_TIMEOUT for every game.
 MAX_CONSECUTIVE_FAILURES = 5
 
-# 120+ popular Steam app IDs (no API key needed to query these)
+# 120+ popular Steam app IDs (no API key needed to query these).
+# These are always tracked. Whatever is in Steam's live top-100 chart is tracked
+# in addition to them (see fetch_top_chart), so this list does not have to keep
+# up with new releases.
 TRACKED_APPIDS = [
     730,      # Counter-Strike 2
     570,      # Dota 2
@@ -214,12 +227,53 @@ def _get_json(url, params):
     return data
 
 
+def _is_count(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def fetch_top_chart():
+    """Steam's live "most played" chart: the 100 games with the most players right now.
+
+    Returns a list in rank order of
+        {"appid": int, "current_players": int, "peak_today": int}
+    where peak_today is the game's peak for the day as Steam reports it. This is
+    the data behind store.steampowered.com/charts/mostplayed. It needs no API
+    key but is not part of Steam's documented Web API, so anything unexpected
+    in the answer raises SteamAPIError instead of being guessed around.
+    """
+    data = _get_json(TOP_CHART_URL, None)
+    response = data.get("response")
+    ranks = response.get("ranks") if isinstance(response, dict) else None
+    if not isinstance(ranks, list) or not ranks:
+        raise SteamAPIError("response has no ranks", status=200)
+
+    last_update = response.get("last_update")
+    if not _is_count(last_update):
+        raise SteamAPIError("response does not say when the chart was updated", status=200)
+    age = time.time() - last_update
+    if age > CHART_MAX_AGE_SECONDS:
+        raise SteamAPIError(f"the chart is {int(age // 60)} minutes old", status=200)
+
+    chart = {}
+    for rank in ranks:
+        if not isinstance(rank, dict):
+            raise SteamAPIError("response has a malformed chart entry", status=200)
+        appid = rank.get("appid")
+        current_players = rank.get("concurrent_in_game")
+        peak_today = rank.get("peak_in_game")
+        if not (_is_count(appid) and _is_count(current_players) and _is_count(peak_today)):
+            raise SteamAPIError("response has a malformed chart entry", status=200)
+        # Keyed by appid so an app listed twice cannot produce two samples.
+        chart.setdefault(appid, {"appid": appid, "current_players": current_players, "peak_today": peak_today})
+    return list(chart.values())
+
+
 def fetch_current_players(appid):
     """Current player count of one app. Raises SteamAPIError if Steam gives none."""
     data = _get_json(PLAYER_COUNT_URL, {"appid": appid})
     response = data.get("response")
     count = response.get("player_count") if isinstance(response, dict) else None
-    if not isinstance(count, int) or isinstance(count, bool):
+    if not _is_count(count):
         raise SteamAPIError("response has no player_count", status=200)
     return count
 
@@ -278,10 +332,6 @@ def _pause(seconds):
     time.sleep(seconds)
 
 
-def _placeholder_name(appid):
-    return f"App {appid}"
-
-
 def scrape_once():
     """Run one scrape cycle and return its summary (get_status() reports it too).
 
@@ -306,23 +356,43 @@ def scrape_once():
 
 
 def _run_cycle():
-    appids = list(TRACKED_APPIDS)
-    log.info("Starting scrape cycle for %d tracked games...", len(appids))
+    log.info("Starting scrape cycle...")
     now = db.utcnow().isoformat()
     problems = []
+    counts = {}
 
-    # Ensure all tracked games have a row in the games table
-    for appid in appids:
-        if not db.get_game_detail(appid):
-            db.upsert_game(appid, _placeholder_name(appid))
+    # 1. Steam's live top chart: one request yields the current count and the
+    #    day's peak of the 100 most played games, whatever they are today.
+    try:
+        chart = fetch_top_chart()
+    except SteamAPIError as e:
+        chart = []
+        log.error("Steam's top chart is unavailable (%s); newly popular games will not be picked up.", e)
+        problems.append(
+            f"Steam's top-100 chart could not be read ({e}). Games that are already tracked are "
+            f"still updated one by one, but newly popular games are not being picked up."
+        )
+    if chart:
+        db.record_chart(chart, now)
+        counts.update((entry["appid"], entry["current_players"]) for entry in chart)
+        log.info("Top chart: recorded %d games.", len(chart))
 
-    counts = _scrape_player_counts(appids, now, problems)
+    # 2. Every other tracked game, one request each: the fixed list plus games
+    #    that were in the chart recently (all of them when the chart is down).
+    tracked = list(dict.fromkeys(TRACKED_APPIDS + db.get_recently_charted(CHART_RETENTION_DAYS)))
+    others = [appid for appid in tracked if appid not in counts]
+    db.ensure_games(others)
+    log.info("Fetching player counts for %d other tracked games...", len(others))
+    counts.update(_scrape_player_counts(others, now, problems))
+
+    # 3. Names and artwork for games seen for the first time.
     _scrape_missing_details(counts, problems)
 
-    log.info("Scrape cycle complete. Got player counts for %d / %d games.", len(counts), len(appids))
+    total = len(counts.keys() | set(tracked))
+    log.info("Scrape cycle complete. Got player counts for %d / %d games.", len(counts), total)
     return {
         "games_ok": len(counts),
-        "games_failed": len(appids) - len(counts),
+        "games_failed": total - len(counts),
         "error": " ".join(problems) or None,
     }
 
@@ -348,8 +418,8 @@ def _scrape_player_counts(appids, now, problems):
                 len(appids) - position,
             )
             problems.append(
-                f"Steam rate-limited the player count requests (HTTP 429), so "
-                f"{len(appids) - len(counts)} of {len(appids)} games were not updated this cycle."
+                f"Steam rate-limited the player count requests (HTTP 429), so {len(appids) - len(counts)} "
+                f"of the {len(appids)} games that are fetched one by one were not updated this cycle."
             )
             break
         except SteamAPIError as e:
@@ -362,20 +432,15 @@ def _scrape_player_counts(appids, now, problems):
                 )
                 problems.append(
                     f"{consecutive_failures} player count requests in a row failed ({e}): Steam or the "
-                    f"network looks unreachable. {len(appids) - len(counts)} of {len(appids)} games "
-                    f"were not updated this cycle."
+                    f"network looks unreachable. {len(appids) - len(counts)} of the {len(appids)} games "
+                    f"that are fetched one by one were not updated this cycle."
                 )
                 break
             continue
 
         consecutive_failures = 0
         counts[appid] = current
-        db.insert_player_count(appid, current, now)
-        # The 24h peak is the highest sample of the last 24 hours (which includes
-        # the one just inserted), not the latest count. upsert_peaks() only ever
-        # raises the all-time peak, so passing the 24h peak for both is correct.
-        peak_24h = db.get_peak_players(appid, hours=24)
-        db.upsert_peaks(appid, peak_24h, peak_24h)
+        db.record_samples([(appid, current, None)], now)
 
     return counts
 
@@ -391,7 +456,7 @@ def _scrape_missing_details(counts, problems):
     pending = []
     for appid in sorted(counts, key=counts.get, reverse=True):
         existing = db.get_game_detail(appid)
-        if existing and existing.get("name") and existing["name"] != _placeholder_name(appid):
+        if existing and existing.get("name") and existing["name"] != db.placeholder_name(appid):
             continue
         if _details_retry_at.get(appid, 0) > time.monotonic():
             continue

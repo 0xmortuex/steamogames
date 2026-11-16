@@ -1,4 +1,6 @@
 """The functions that talk to Steam, exercised against canned HTTP responses."""
+import time
+
 import pytest
 import requests
 
@@ -40,6 +42,81 @@ def steam_answers(monkeypatch):
         return session
 
     return install
+
+
+def chart_payload(ranks=None, age_seconds=240, **overrides):
+    """A GetGamesByConcurrentPlayers answer; the default ranks are copied from a real one."""
+    if ranks is None:
+        ranks = [
+            {"rank": 1, "appid": 730, "concurrent_in_game": 704464, "peak_in_game": 1299141},
+            {"rank": 2, "appid": 570, "concurrent_in_game": 567006, "peak_in_game": 874632},
+            {"rank": 5, "appid": 3419430, "concurrent_in_game": 196305, "peak_in_game": 196305},
+        ]
+    response = {"last_update": int(time.time()) - age_seconds, "ranks": ranks}
+    response.update(overrides)
+    return {"response": response}
+
+
+def test_fetch_top_chart_returns_counts_and_peaks_in_rank_order(steam_answers):
+    session = steam_answers(FakeResponse(payload=chart_payload()))
+
+    assert scraper.fetch_top_chart() == [
+        {"appid": 730, "current_players": 704464, "peak_today": 1299141},
+        {"appid": 570, "current_players": 567006, "peak_today": 874632},
+        {"appid": 3419430, "current_players": 196305, "peak_today": 196305},
+    ]
+    assert session.requests == [
+        {"url": scraper.TOP_CHART_URL, "params": None, "timeout": scraper.REQUEST_TIMEOUT}
+    ]
+
+
+def test_fetch_top_chart_rejects_a_stale_chart(steam_answers):
+    steam_answers(FakeResponse(payload=chart_payload(age_seconds=scraper.CHART_MAX_AGE_SECONDS + 90)))
+
+    with pytest.raises(SteamAPIError) as error:
+        scraper.fetch_top_chart()
+
+    assert str(error.value) == "the chart is 31 minutes old"
+
+
+def test_fetch_top_chart_lists_an_app_only_once(steam_answers):
+    steam_answers(FakeResponse(payload=chart_payload(ranks=[
+        {"rank": 1, "appid": 730, "concurrent_in_game": 700, "peak_in_game": 900},
+        {"rank": 2, "appid": 730, "concurrent_in_game": 600, "peak_in_game": 800},
+    ])))
+
+    assert scraper.fetch_top_chart() == [{"appid": 730, "current_players": 700, "peak_today": 900}]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"response": {}},
+        {"response": {"last_update": 1794827246, "ranks": []}},
+        chart_payload(last_update=None),
+        chart_payload(ranks="unavailable"),
+        chart_payload(ranks=[None]),
+        chart_payload(ranks=[{"rank": 1, "appid": 730, "peak_in_game": 5}]),
+        chart_payload(ranks=[{"rank": 1, "appid": 730, "concurrent_in_game": 5}]),
+        chart_payload(ranks=[{"rank": 1, "appid": 730, "concurrent_in_game": -1, "peak_in_game": 5}]),
+        chart_payload(ranks=[{"rank": 1, "appid": "730", "concurrent_in_game": 5, "peak_in_game": 5}]),
+    ],
+)
+def test_unusable_chart_answers_are_errors(steam_answers, payload):
+    steam_answers(FakeResponse(payload=payload))
+
+    with pytest.raises(SteamAPIError):
+        scraper.fetch_top_chart()
+
+
+def test_fetch_top_chart_reports_http_errors(steam_answers):
+    steam_answers(FakeResponse(status_code=503))
+
+    with pytest.raises(SteamAPIError) as error:
+        scraper.fetch_top_chart()
+
+    assert str(error.value) == "HTTP 503"
 
 
 def test_fetch_current_players_returns_the_count(steam_answers):

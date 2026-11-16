@@ -10,16 +10,28 @@ from scraper import SteamAPIError, SteamRateLimited
 class FakeSteam:
     """Stands in for the Steam endpoints so scrape cycles run offline and instantly.
 
+    `chart` is Steam's top chart as [(appid, current players, peak today), ...],
+    or an exception to raise. It is empty unless a test fills it.
     `counts` maps appid -> player count, or an exception to raise for that app.
     `details` maps appid -> details dict, None ("the store has no page"), or an
     exception. Apps missing from `counts` answer HTTP 404 like Steam does.
     """
 
     def __init__(self):
+        self.chart = []
         self.counts = {}
         self.details = {}
         self.calls = []
         self.pauses = []
+
+    def fetch_top_chart(self):
+        self.calls.append(("chart", None))
+        if isinstance(self.chart, Exception):
+            raise self.chart
+        return [
+            {"appid": appid, "current_players": current, "peak_today": peak}
+            for appid, current, peak in self.chart
+        ]
 
     def fetch_current_players(self, appid):
         self.calls.append(("count", appid))
@@ -47,6 +59,7 @@ def details(name):
 def steam(monkeypatch):
     fake = FakeSteam()
     monkeypatch.setattr(scraper, "TRACKED_APPIDS", [10, 20])
+    monkeypatch.setattr(scraper, "fetch_top_chart", fake.fetch_top_chart)
     monkeypatch.setattr(scraper, "fetch_current_players", fake.fetch_current_players)
     monkeypatch.setattr(scraper, "fetch_game_details", fake.fetch_game_details)
     monkeypatch.setattr(scraper, "_pause", fake.pauses.append)
@@ -72,13 +85,108 @@ def test_scrape_records_counts_and_game_details(steam):
 
 
 def test_all_samples_of_a_cycle_share_one_timestamp(steam):
+    steam.chart = [(30, 900, 950)]
     steam.counts = {10: 500, 20: 30}
 
     scraper.scrape_once()
 
     timestamps = {g["timestamp"] for g in db.get_top_games()}
+    assert len(db.get_top_games()) == 3
     assert len(timestamps) == 1
     assert db.get_latest_sample_time() in timestamps
+
+
+def test_games_in_steams_top_chart_are_tracked_without_being_listed(steam):
+    steam.chart = [(30, 9000, 12000), (40, 800, 900)]
+    steam.counts = {10: 500, 20: 30}
+    steam.details = {30: details("Thirty"), 40: details("Forty")}
+
+    summary = scraper.scrape_once()
+
+    top = db.get_top_games()
+    assert [(g["appid"], g["name"], g["current_players"]) for g in top] == [
+        (30, "Thirty", 9000),
+        (40, "Forty", 800),
+        (10, "App 10", 500),
+        (20, "App 20", 30),
+    ]
+    assert summary == {"games_ok": 4, "games_failed": 0, "error": None}
+
+
+def test_chart_games_are_not_requested_individually(steam):
+    steam.chart = [(30, 9000, 12000), (10, 600, 700)]
+    steam.counts = {10: 1, 20: 30, 30: 1}
+
+    scraper.scrape_once()
+
+    assert steam.requested("count") == [20]
+    assert db.get_game_detail(10)["peak_24h"] == 700
+    assert [g["current_players"] for g in db.get_top_games()] == [9000, 600, 30]
+
+
+def test_chart_peak_is_stored_as_24h_and_all_time_peak(steam):
+    steam.chart = [(30, 9000, 12000)]
+    steam.counts = {10: 500, 20: 30}
+
+    scraper.scrape_once()
+
+    charted = db.get_game_detail(30)
+    listed = db.get_game_detail(10)
+    assert (charted["peak_24h"], charted["all_time_peak"]) == (12000, 12000)
+    assert (listed["peak_24h"], listed["all_time_peak"]) == (500, 500)
+
+
+def test_game_that_left_the_chart_is_still_tracked_one_by_one(steam):
+    steam.chart = [(30, 9000, 12000)]
+    steam.counts = {10: 500, 20: 30}
+    scraper.scrape_once()
+
+    steam.chart = [(40, 9500, 9900)]
+    steam.counts = {10: 510, 20: 31, 30: 8000}
+    summary = scraper.scrape_once()
+
+    assert steam.requested("count") == [10, 20, 10, 20, 30]
+    assert [h["current_players"] for h in db.get_player_history(30)] == [9000, 8000]
+    assert db.get_game_detail(30)["peak_24h"] == 9000  # Steam's 12000 no longer applies; ours does
+    assert db.get_game_detail(30)["all_time_peak"] == 12000
+    assert summary == {"games_ok": 4, "games_failed": 0, "error": None}
+
+
+def test_game_that_left_the_chart_long_ago_is_dropped(steam, ago):
+    db.record_chart([{"appid": 30, "current_players": 9000, "peak_today": 9000}],
+                    ago(days=scraper.CHART_RETENTION_DAYS, minutes=1))
+    steam.counts = {10: 500, 20: 30, 30: 8000}
+
+    summary = scraper.scrape_once()
+
+    assert steam.requested("count") == [10, 20]
+    assert [g["appid"] for g in db.get_top_games()] == [10, 20]
+    assert summary == {"games_ok": 2, "games_failed": 0, "error": None}
+
+
+def test_everything_is_fetched_one_by_one_when_the_chart_is_unavailable(steam):
+    steam.chart = [(30, 9000, 12000)]
+    steam.counts = {10: 500, 20: 30}
+    scraper.scrape_once()
+
+    steam.chart = SteamAPIError("HTTP 503", status=503)
+    steam.counts = {10: 510, 20: 31, 30: 8800}
+    summary = scraper.scrape_once()
+
+    assert steam.requested("count") == [10, 20, 10, 20, 30]
+    assert [g["current_players"] for g in db.get_top_games()] == [8800, 510, 31]
+    assert summary["games_ok"] == 3
+    assert summary["games_failed"] == 0
+    assert summary["error"].startswith("Steam's top-100 chart could not be read (HTTP 503).")
+
+
+def test_chart_and_listed_games_failing_are_counted(steam):
+    steam.chart = [(30, 9000, 12000)]
+    steam.counts = {10: 500}  # 20 answers HTTP 404
+
+    summary = scraper.scrape_once()
+
+    assert summary == {"games_ok": 2, "games_failed": 1, "error": None}
 
 
 def test_peak_24h_is_the_highest_sample_not_the_latest(steam):
@@ -131,7 +239,7 @@ def test_rate_limit_stops_the_player_count_requests(steam, monkeypatch):
     assert summary["games_ok"] == 1
     assert summary["games_failed"] == 3
     assert "HTTP 429" in summary["error"]
-    assert "3 of 4 games were not updated" in summary["error"]
+    assert "3 of the 4 games that are fetched one by one were not updated" in summary["error"]
 
 
 def test_consecutive_connection_failures_stop_the_pass(steam, monkeypatch):
@@ -146,7 +254,7 @@ def test_consecutive_connection_failures_stop_the_pass(steam, monkeypatch):
     assert summary["games_ok"] == 1
     assert summary["games_failed"] == 9
     assert "5 player count requests in a row failed (could not connect)" in summary["error"]
-    assert "9 of 10 games were not updated" in summary["error"]
+    assert "9 of the 10 games that are fetched one by one were not updated" in summary["error"]
 
 
 def test_per_game_errors_do_not_count_as_an_outage(steam, monkeypatch):
@@ -273,7 +381,7 @@ def test_crash_is_recorded_and_raised(steam, monkeypatch):
     def broken_insert(*args):
         raise sqlite3.OperationalError("database or disk is full")
 
-    monkeypatch.setattr(db, "insert_player_count", broken_insert)
+    monkeypatch.setattr(db, "record_samples", broken_insert)
 
     with pytest.raises(sqlite3.OperationalError):
         scraper.scrape_once()
