@@ -1,0 +1,26 @@
+[project]
+name = "steamogames"
+version = "0.1.0"
+description = "Live Steam game player statistics dashboard"
+readme = "README.md"
+requires-python = ">=3.10"
+# Keep in sync with requirements.txt (kept for pip users).
+dependencies = [
+    "flask==3.1.0",
+    "requests==2.32.3",
+    "APScheduler==3.11.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+]
+
+[tool.uv]
+# An application made of top-level modules (app.py, scraper.py, database.py),
+# not an installable package.
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

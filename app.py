@@ -101,7 +101,10 @@ def ensure_scraper():
         t.start()
 
 
-ensure_scraper()
+# The dashboard runs its own scraper thread. Set SCRAPER_ENABLED=0 to serve the
+# dashboard only (tests, or when `python scraper.py` runs as a separate process).
+if os.getenv("SCRAPER_ENABLED", "1") != "0":
+    ensure_scraper()
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
