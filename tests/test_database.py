@@ -176,6 +176,26 @@ def test_total_players_is_zero_for_empty_database():
     assert db.get_total_players() == 0
 
 
+def test_latest_sample_time_is_the_newest_sample_of_any_game(ago):
+    assert db.get_latest_sample_time() is None
+
+    newest = ago(minutes=2)
+    add_game(10, "A", [(1, ago(hours=5)), (1, ago(minutes=7))])
+    add_game(20, "B", [(1, newest), (1, ago(days=3))])
+    db.upsert_game(30, "Never scraped")
+
+    assert db.get_latest_sample_time() == newest
+
+
+def test_utcnow_is_naive_utc():
+    from datetime import datetime, timezone
+
+    now = db.utcnow()
+
+    assert now.tzinfo is None
+    assert abs((datetime.now(timezone.utc).replace(tzinfo=None) - now).total_seconds()) < 5
+
+
 def test_tracked_game_count(ago):
     add_game(10, "A", [(1, ago(minutes=1))])
     add_game(20, "B", [(1, ago(minutes=1))])

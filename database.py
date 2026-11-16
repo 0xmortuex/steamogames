@@ -1,10 +1,20 @@
 import sqlite3
 import os
 from contextlib import closing
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 DB_PATH = os.path.join(DB_DIR, "steam.db")
+
+
+def utcnow():
+    """Current UTC time as a naive datetime.
+
+    Every timestamp in the database is a naive-UTC ISO 8601 string (the format
+    datetime.utcnow().isoformat() produced), so they sort and compare as text.
+    datetime.utcnow() itself is deprecated since Python 3.12.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def get_connection():
@@ -65,7 +75,7 @@ def upsert_game(appid, name, thumbnail_url=None, header_image_url=None):
 
 def insert_player_count(appid, current_players, timestamp=None):
     if timestamp is None:
-        timestamp = datetime.utcnow().isoformat()
+        timestamp = utcnow().isoformat()
     conn = get_connection()
     conn.execute(
         "INSERT INTO player_counts (appid, current_players, timestamp) VALUES (?, ?, ?)",
@@ -76,7 +86,7 @@ def insert_player_count(appid, current_players, timestamp=None):
 
 
 def upsert_peaks(appid, peak_24h, all_time_peak):
-    now = datetime.utcnow().isoformat()
+    now = utcnow().isoformat()
     conn = get_connection()
     conn.execute("""
         INSERT INTO peaks (appid, peak_24h, all_time_peak, last_updated)
@@ -142,7 +152,7 @@ def get_game_detail(appid):
 
 
 def get_player_history(appid, hours=24):
-    since = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+    since = (utcnow() - timedelta(hours=hours)).isoformat()
     conn = get_connection()
     rows = conn.execute("""
         SELECT current_players, timestamp
@@ -156,7 +166,7 @@ def get_player_history(appid, hours=24):
 
 def get_peak_players(appid, hours=24):
     """Highest sampled player count in the last `hours` hours, or None if there are no samples."""
-    since = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+    since = (utcnow() - timedelta(hours=hours)).isoformat()
     conn = get_connection()
     row = conn.execute("""
         SELECT MAX(current_players) AS peak
@@ -168,7 +178,7 @@ def get_peak_players(appid, hours=24):
 
 
 def _sparkline(conn, appid, points):
-    since = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+    since = (utcnow() - timedelta(hours=24)).isoformat()
     rows = conn.execute("""
         SELECT current_players
         FROM player_counts
@@ -183,8 +193,8 @@ def _sparkline(conn, appid, points):
 
 
 def _player_count_yesterday(conn, appid):
-    t_start = (datetime.utcnow() - timedelta(hours=28)).isoformat()
-    t_end = (datetime.utcnow() - timedelta(hours=20)).isoformat()
+    t_start = (utcnow() - timedelta(hours=28)).isoformat()
+    t_end = (utcnow() - timedelta(hours=20)).isoformat()
     row = conn.execute("""
         SELECT AVG(current_players) as avg_players
         FROM player_counts
@@ -247,6 +257,23 @@ def get_total_players():
     return row["total"] if row and row["total"] else 0
 
 
+def get_latest_sample_time():
+    """Timestamp of the newest sample of any game, or None before the first scrape.
+
+    This is when the dashboard's data was last refreshed. It is found with one
+    index seek per game; MAX(timestamp) over player_counts would read every row.
+    """
+    with closing(get_connection()) as conn:
+        row = conn.execute("""
+            SELECT MAX(newest) AS newest
+            FROM (
+                SELECT (SELECT MAX(timestamp) FROM player_counts WHERE appid = g.appid) AS newest
+                FROM games g
+            )
+        """).fetchone()
+    return row["newest"]
+
+
 def get_tracked_game_count():
     conn = get_connection()
     row = conn.execute("SELECT COUNT(*) as cnt FROM games").fetchone()
@@ -255,7 +282,7 @@ def get_tracked_game_count():
 
 
 def cleanup_old_data(days=90):
-    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    cutoff = (utcnow() - timedelta(days=days)).isoformat()
     conn = get_connection()
     conn.execute("DELETE FROM player_counts WHERE timestamp < ?", (cutoff,))
     conn.commit()

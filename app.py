@@ -4,12 +4,17 @@ import logging
 from flask import Flask, jsonify, request, render_template
 
 import database as db
+import scraper
 from scraper import scrape_once
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+# The dashboard runs its own scraper thread. Set SCRAPER_ENABLED=0 to serve the
+# dashboard only (tests, or when `python scraper.py` runs as a separate process).
+SCRAPER_ENABLED = os.getenv("SCRAPER_ENABLED", "1") != "0"
 
 # Initialize database
 db.init_db()
@@ -21,13 +26,15 @@ def start_background_scraper():
     log.info("Running initial scrape in background...")
     try:
         scrape_once()
-    except Exception as e:
-        log.error("Initial scrape failed: %s", e)
+    except Exception:
+        # scrape_once() has recorded the failure for the dashboard; keep the
+        # traceback in the log and still start the schedule so scraping resumes.
+        log.exception("Initial scrape failed")
 
     scheduler = BackgroundScheduler()
-    scheduler.add_job(scrape_once, "interval", minutes=5, id="steam_scrape")
+    scheduler.add_job(scrape_once, "interval", minutes=scraper.SCRAPE_INTERVAL_MINUTES, id="steam_scrape")
     scheduler.start()
-    log.info("Background scraper started (every 5 minutes).")
+    log.info("Background scraper started (every %d minutes).", scraper.SCRAPE_INTERVAL_MINUTES)
 
 
 @app.route("/")
@@ -56,6 +63,9 @@ def api_top():
         "games": games,
         "total_players": db.get_total_players(),
         "tracked_count": db.get_tracked_game_count(),
+        # When the data was last refreshed (UTC), as opposed to when it was fetched.
+        "updated_at": db.get_latest_sample_time(),
+        "scraper": {"enabled": SCRAPER_ENABLED, **scraper.get_status()},
     })
 
 
@@ -102,9 +112,7 @@ def ensure_scraper():
         t.start()
 
 
-# The dashboard runs its own scraper thread. Set SCRAPER_ENABLED=0 to serve the
-# dashboard only (tests, or when `python scraper.py` runs as a separate process).
-if os.getenv("SCRAPER_ENABLED", "1") != "0":
+if SCRAPER_ENABLED:
     ensure_scraper()
 
 if __name__ == "__main__":

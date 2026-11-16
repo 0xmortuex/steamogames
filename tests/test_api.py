@@ -42,6 +42,38 @@ def test_top_lists_games_with_trend_and_sparkline(client, ago):
     assert data["tracked_count"] == 2
 
 
+def test_top_reports_when_the_data_was_last_refreshed(client, ago):
+    assert client.get("/api/top").get_json()["updated_at"] is None
+
+    newest = ago(minutes=3)
+    add_game(10, "A", [(1, ago(hours=2)), (2, newest)])
+    add_game(20, "B", [(1, ago(minutes=8))])
+
+    assert client.get("/api/top").get_json()["updated_at"] == newest
+
+
+def test_top_includes_the_scraper_status(client, monkeypatch):
+    import scraper
+
+    monkeypatch.setattr(scraper, "_status", {
+        "running": False,
+        "last_started": "2026-11-16T11:12:01",
+        "last_finished": "2026-11-16T11:13:26",
+        "games_ok": 100,
+        "games_failed": 22,
+        "error": "Steam rate-limited the player count requests (HTTP 429), so 22 of 122 games were not updated this cycle.",
+    })
+
+    status = client.get("/api/top").get_json()["scraper"]
+
+    assert status["enabled"] is False  # the test suite runs with SCRAPER_ENABLED=0
+    assert status["running"] is False
+    assert status["last_finished"] == "2026-11-16T11:13:26"
+    assert status["games_ok"] == 100
+    assert status["games_failed"] == 22
+    assert "HTTP 429" in status["error"]
+
+
 def test_top_honours_limit(client, ago):
     for appid in range(1, 4):
         add_game(appid, f"Game {appid}", [(appid, ago(minutes=1))])

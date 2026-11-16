@@ -1,7 +1,7 @@
 import time
 import logging
+import threading
 import requests
-from datetime import datetime
 
 import database as db
 
@@ -9,6 +9,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 10
+SCRAPE_INTERVAL_MINUTES = 5
+
+PLAYER_COUNT_URL = "https://api.steampowered.com/ISteamUserStats/GetNumberOfCurrentPlayers/v1/"
+APP_DETAILS_URL = "https://store.steampowered.com/api/appdetails"
+
+# Pauses between requests. Steam publishes no limit for keyless calls; the store
+# API is known to block clients that go much above 200 requests per 5 minutes.
+PLAYER_COUNT_DELAY = 0.3
+DETAILS_DELAY = 1.5
+
+# When the store has no page for an app, do not ask again for this long
+# (instead of once per cycle, forever).
+DETAILS_RETRY_SECONDS = 60 * 60
+
+# After this many connection-level failures in a row, Steam or the network is
+# down: stop the pass instead of waiting out REQUEST_TIMEOUT for every game.
+MAX_CONSECUTIVE_FAILURES = 5
 
 # 120+ popular Steam app IDs (no API key needed to query these)
 TRACKED_APPIDS = [
@@ -146,58 +163,213 @@ TRACKED_APPIDS = [
 TRACKED_APPIDS = list(dict.fromkeys(TRACKED_APPIDS))
 
 
-def fetch_current_players(appid):
-    url = f"https://api.steampowered.com/ISteamUserStats/GetNumberOfCurrentPlayers/v1/?appid={appid}"
+class SteamAPIError(Exception):
+    """A Steam endpoint could not be reached or did not return a usable answer.
+
+    `status` is the HTTP status code, or None when there was no HTTP response at
+    all (DNS failure, refused connection, timeout).
+    """
+
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+    @property
+    def is_outage(self):
+        """True if the failure is about Steam or the network as a whole, not about one app."""
+        return self.status is None or self.status >= 500
+
+
+class SteamRateLimited(SteamAPIError):
+    """Steam answered HTTP 429: stop sending this kind of request for the rest of the cycle."""
+
+
+# One session for the whole process so the hundred-odd requests of a cycle reuse
+# a connection instead of each doing a new TLS handshake. Only the scraper
+# thread uses it.
+_session = requests.Session()
+
+
+def _get_json(url, params):
+    """GET a Steam endpoint and return its JSON object, or raise SteamAPIError."""
     try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
+        resp = _session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    except requests.Timeout as e:
+        raise SteamAPIError(f"no response within {REQUEST_TIMEOUT}s") from e
+    except requests.ConnectionError as e:
+        raise SteamAPIError("could not connect") from e
+    except requests.RequestException as e:
+        raise SteamAPIError(f"request failed ({type(e).__name__})") from e
+
+    if resp.status_code == 429:
+        raise SteamRateLimited("rate limited (HTTP 429)", status=429)
+    if resp.status_code != 200:
+        raise SteamAPIError(f"HTTP {resp.status_code}", status=resp.status_code)
+    try:
         data = resp.json()
-        count = data.get("response", {}).get("player_count")
-        if count is not None:
-            return count
-    except Exception as e:
-        log.warning("Failed to fetch player count for appid %s: %s", appid, e)
-    return None
+    except ValueError as e:
+        raise SteamAPIError("response is not JSON", status=200) from e
+    if not isinstance(data, dict):
+        raise SteamAPIError("response is not a JSON object", status=200)
+    return data
+
+
+def fetch_current_players(appid):
+    """Current player count of one app. Raises SteamAPIError if Steam gives none."""
+    data = _get_json(PLAYER_COUNT_URL, {"appid": appid})
+    response = data.get("response")
+    count = response.get("player_count") if isinstance(response, dict) else None
+    if not isinstance(count, int) or isinstance(count, bool):
+        raise SteamAPIError("response has no player_count", status=200)
+    return count
 
 
 def fetch_game_details(appid):
-    url = f"https://store.steampowered.com/api/appdetails?appids={appid}"
-    try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        app_data = data.get(str(appid), {})
-        if app_data.get("success"):
-            info = app_data["data"]
-            return {
-                "name": info.get("name", f"App {appid}"),
-                "thumbnail_url": info.get("capsule_image", ""),
-                "header_image_url": info.get("header_image", ""),
-            }
-    except Exception as e:
-        log.warning("Failed to fetch details for appid %s: %s", appid, e)
-    return None
+    """Name and artwork of one app from the store.
+
+    Returns None when the store answers that it has no page for the app, and
+    raises SteamAPIError when it gives no usable answer at all.
+    """
+    data = _get_json(APP_DETAILS_URL, {"appids": appid})
+    entry = data.get(str(appid))
+    if not isinstance(entry, dict):
+        raise SteamAPIError("response has no entry for the app", status=200)
+    if not entry.get("success"):
+        return None
+    info = entry.get("data")
+    if not isinstance(info, dict):
+        raise SteamAPIError("response reports success but has no data", status=200)
+    return {
+        "name": info.get("name", f"App {appid}"),
+        "thumbnail_url": info.get("capsule_image", ""),
+        "header_image_url": info.get("header_image", ""),
+    }
+
+
+_status_lock = threading.Lock()
+_status = {
+    "running": False,
+    "last_started": None,
+    "last_finished": None,
+    "games_ok": None,
+    "games_failed": None,
+    "error": None,
+}
+
+# appid -> time.monotonic() value before which the store is not asked about it again.
+_details_retry_at = {}
+
+
+def get_status():
+    """State of the scraper in this process, for the dashboard.
+
+    running        a cycle is in progress
+    last_started   when the latest cycle started (naive-UTC ISO string), or None
+    last_finished  when the latest cycle ended, or None
+    games_ok       games that got a new sample in the last finished cycle
+    games_failed   tracked games that did not
+    error          what cut the last finished cycle short, or None if nothing did
+    """
+    with _status_lock:
+        return dict(_status)
+
+
+def _pause(seconds):
+    time.sleep(seconds)
+
+
+def _placeholder_name(appid):
+    return f"App {appid}"
 
 
 def scrape_once():
-    log.info("Starting scrape cycle for %d tracked games...", len(TRACKED_APPIDS))
-    now = datetime.utcnow().isoformat()
-    success_count = 0
-    games_needing_details = []
+    """Run one scrape cycle and return its summary (get_status() reports it too).
 
-    # First pass: ensure all tracked games have a row in the games table
-    for appid in TRACKED_APPIDS:
-        existing = db.get_game_detail(appid)
-        if not existing:
-            db.upsert_game(appid, f"App {appid}")
+    A failed request is logged and counted but never raised: one unreachable
+    game must not cost the others their sample. Anything else (a bug, a
+    database error) is recorded in the status and then propagates.
+    """
+    with _status_lock:
+        _status["running"] = True
+        _status["last_started"] = db.utcnow().isoformat()
 
-    # Second pass: fetch player counts
-    for appid in TRACKED_APPIDS:
-        current = fetch_current_players(appid)
-        if current is None:
+    summary = {"games_ok": None, "games_failed": None, "error": None}
+    try:
+        summary = _run_cycle()
+        return summary
+    except Exception as e:
+        summary["error"] = f"The scrape cycle crashed ({type(e).__name__}: {e})."
+        raise
+    finally:
+        with _status_lock:
+            _status.update(summary, running=False, last_finished=db.utcnow().isoformat())
+
+
+def _run_cycle():
+    appids = list(TRACKED_APPIDS)
+    log.info("Starting scrape cycle for %d tracked games...", len(appids))
+    now = db.utcnow().isoformat()
+    problems = []
+
+    # Ensure all tracked games have a row in the games table
+    for appid in appids:
+        if not db.get_game_detail(appid):
+            db.upsert_game(appid, _placeholder_name(appid))
+
+    counts = _scrape_player_counts(appids, now, problems)
+    _scrape_missing_details(counts, problems)
+
+    log.info("Scrape cycle complete. Got player counts for %d / %d games.", len(counts), len(appids))
+    return {
+        "games_ok": len(counts),
+        "games_failed": len(appids) - len(counts),
+        "error": " ".join(problems) or None,
+    }
+
+
+def _scrape_player_counts(appids, now, problems):
+    """Fetch and store the current player count of each app.
+
+    Returns {appid: count} for the apps that got a sample, and appends a
+    sentence to `problems` if the pass had to be cut short.
+    """
+    counts = {}
+    consecutive_failures = 0
+
+    for position, appid in enumerate(appids):
+        if position:
+            _pause(PLAYER_COUNT_DELAY)
+
+        try:
+            current = fetch_current_players(appid)
+        except SteamRateLimited:
+            log.error(
+                "Steam rate-limited the player count requests; skipping the remaining %d games this cycle.",
+                len(appids) - position,
+            )
+            problems.append(
+                f"Steam rate-limited the player count requests (HTTP 429), so "
+                f"{len(appids) - len(counts)} of {len(appids)} games were not updated this cycle."
+            )
+            break
+        except SteamAPIError as e:
+            log.warning("No player count for appid %s: %s", appid, e)
+            consecutive_failures = consecutive_failures + 1 if e.is_outage else 0
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                log.error(
+                    "%d player count requests in a row failed; skipping the remaining %d games this cycle.",
+                    consecutive_failures, len(appids) - position - 1,
+                )
+                problems.append(
+                    f"{consecutive_failures} player count requests in a row failed ({e}): Steam or the "
+                    f"network looks unreachable. {len(appids) - len(counts)} of {len(appids)} games "
+                    f"were not updated this cycle."
+                )
+                break
             continue
 
-        success_count += 1
+        consecutive_failures = 0
+        counts[appid] = current
         db.insert_player_count(appid, current, now)
         # The 24h peak is the highest sample of the last 24 hours (which includes
         # the one just inserted), not the latest count. upsert_peaks() only ever
@@ -205,29 +377,72 @@ def scrape_once():
         peak_24h = db.get_peak_players(appid, hours=24)
         db.upsert_peaks(appid, peak_24h, peak_24h)
 
+    return counts
+
+
+def _scrape_missing_details(counts, problems):
+    """Look up name and artwork for sampled games that only have a placeholder name.
+
+    `counts` is {appid: current players}; the most played games are looked up
+    first because they are at the top of the dashboard. The store API is slow
+    (one request every DETAILS_DELAY seconds), so on a fresh database this pass
+    takes a few minutes.
+    """
+    pending = []
+    for appid in sorted(counts, key=counts.get, reverse=True):
         existing = db.get_game_detail(appid)
-        if not existing or not existing.get("name") or existing["name"] == f"App {appid}":
-            games_needing_details.append(appid)
+        if existing and existing.get("name") and existing["name"] != _placeholder_name(appid):
+            continue
+        if _details_retry_at.get(appid, 0) > time.monotonic():
+            continue
+        pending.append(appid)
 
-        # Small delay to respect rate limits (~200 req / 5 min)
-        time.sleep(0.3)
+    log.info("Fetching details for %d new games...", len(pending))
+    consecutive_failures = 0
 
-    # Fetch game details for unknown games (store API is slower, 1 req/sec)
-    log.info("Fetching details for %d new games...", len(games_needing_details))
-    for i, appid in enumerate(games_needing_details):
-        details = fetch_game_details(appid)
-        if details:
-            db.upsert_game(
-                appid,
-                details["name"],
-                details.get("thumbnail_url"),
-                details.get("header_image_url"),
+    for position, appid in enumerate(pending):
+        if position:
+            _pause(DETAILS_DELAY)
+
+        try:
+            details = fetch_game_details(appid)
+        except SteamRateLimited:
+            remaining = len(pending) - position
+            log.error("The Steam store rate-limited the detail lookups; %d games stay unnamed for now.", remaining)
+            problems.append(
+                f"The Steam store rate-limited the game detail lookups (HTTP 429), so {remaining} "
+                f"games keep a placeholder name until a later cycle."
             )
+            break
+        except SteamAPIError as e:
+            log.warning("No store details for appid %s: %s", appid, e)
+            consecutive_failures = consecutive_failures + 1 if e.is_outage else 0
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                remaining = len(pending) - position - 1 + consecutive_failures
+                log.error("%d detail lookups in a row failed; %d games stay unnamed for now.",
+                          consecutive_failures, remaining)
+                problems.append(
+                    f"{consecutive_failures} game detail lookups in a row failed ({e}), so {remaining} "
+                    f"games keep a placeholder name until a later cycle."
+                )
+                break
+            continue
 
-        if i < len(games_needing_details) - 1:
-            time.sleep(1.5)
+        consecutive_failures = 0
+        if details is None:
+            log.warning(
+                "The Steam store has no page for appid %s; not asking again for %d minutes.",
+                appid, DETAILS_RETRY_SECONDS // 60,
+            )
+            _details_retry_at[appid] = time.monotonic() + DETAILS_RETRY_SECONDS
+            continue
 
-    log.info("Scrape cycle complete. Got player counts for %d / %d games.", success_count, len(TRACKED_APPIDS))
+        db.upsert_game(
+            appid,
+            details["name"],
+            details.get("thumbnail_url"),
+            details.get("header_image_url"),
+        )
 
 
 def run_scheduler():
@@ -238,8 +453,8 @@ def run_scheduler():
     scrape_once()
 
     scheduler = BlockingScheduler()
-    scheduler.add_job(scrape_once, "interval", minutes=5, id="steam_scrape")
-    log.info("Scheduler started. Scraping every 5 minutes.")
+    scheduler.add_job(scrape_once, "interval", minutes=SCRAPE_INTERVAL_MINUTES, id="steam_scrape")
+    log.info("Scheduler started. Scraping every %d minutes.", SCRAPE_INTERVAL_MINUTES)
     scheduler.start()
 
 
