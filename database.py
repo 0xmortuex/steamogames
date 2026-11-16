@@ -1,5 +1,6 @@
 import sqlite3
 import os
+from contextlib import closing
 from datetime import datetime, timedelta
 
 DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -93,9 +94,21 @@ def upsert_peaks(appid, peak_24h, all_time_peak):
     conn.close()
 
 
+# Correlated subquery selecting the id of a game's newest sample. It is a single
+# seek in idx_player_counts_appid_ts per game, so "latest count per game" costs
+# the same whether the history holds a day or three months of samples. (Ranking
+# every row with ROW_NUMBER() instead reads the whole player_counts table.)
+_LATEST_SAMPLE_ID = """(
+    SELECT id FROM player_counts
+    WHERE appid = g.appid
+    ORDER BY timestamp DESC, id DESC
+    LIMIT 1
+)"""
+
+
 def get_top_games(limit=100):
     conn = get_connection()
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT
             g.appid,
             g.name,
@@ -106,14 +119,9 @@ def get_top_games(limit=100):
             pc.current_players,
             pc.timestamp
         FROM games g
+        JOIN player_counts pc ON pc.id = {_LATEST_SAMPLE_ID}
         LEFT JOIN peaks p ON g.appid = p.appid
-        LEFT JOIN (
-            SELECT appid, current_players, timestamp,
-                   ROW_NUMBER() OVER (PARTITION BY appid ORDER BY timestamp DESC) as rn
-            FROM player_counts
-        ) pc ON g.appid = pc.appid AND pc.rn = 1
-        WHERE pc.current_players IS NOT NULL
-        ORDER BY pc.current_players DESC
+        ORDER BY pc.current_players DESC, g.appid
         LIMIT ?
     """, (limit,)).fetchall()
     conn.close()
@@ -159,16 +167,14 @@ def get_peak_players(appid, hours=24):
     return row["peak"]
 
 
-def get_sparkline_data(appid, points=24):
+def _sparkline(conn, appid, points):
     since = (datetime.utcnow() - timedelta(hours=24)).isoformat()
-    conn = get_connection()
     rows = conn.execute("""
         SELECT current_players
         FROM player_counts
         WHERE appid = ? AND timestamp >= ?
         ORDER BY timestamp ASC
     """, (appid, since)).fetchall()
-    conn.close()
     values = [r["current_players"] for r in rows]
     if len(values) <= points:
         return values
@@ -176,32 +182,54 @@ def get_sparkline_data(appid, points=24):
     return [values[int(i * step)] for i in range(points)]
 
 
-def get_player_count_yesterday(appid):
+def _player_count_yesterday(conn, appid):
     t_start = (datetime.utcnow() - timedelta(hours=28)).isoformat()
     t_end = (datetime.utcnow() - timedelta(hours=20)).isoformat()
-    conn = get_connection()
     row = conn.execute("""
         SELECT AVG(current_players) as avg_players
         FROM player_counts
         WHERE appid = ? AND timestamp BETWEEN ? AND ?
     """, (appid, t_start, t_end)).fetchone()
-    conn.close()
     return row["avg_players"] if row and row["avg_players"] else None
+
+
+def get_sparkline_data(appid, points=24):
+    with closing(get_connection()) as conn:
+        return _sparkline(conn, appid, points)
+
+
+def get_player_count_yesterday(appid):
+    with closing(get_connection()) as conn:
+        return _player_count_yesterday(conn, appid)
+
+
+def get_trend_data(appids, points=24):
+    """Yesterday's average and the 24h sparkline for many games at once.
+
+    Returns {appid: {"yesterday": float | None, "sparkline": [int, ...]}}. It
+    answers the same questions as get_player_count_yesterday() and
+    get_sparkline_data() but over a single connection: opening one per game
+    made /api/top spend ~0.5s on connection setup alone for 100 games.
+    """
+    with closing(get_connection()) as conn:
+        return {
+            appid: {
+                "yesterday": _player_count_yesterday(conn, appid),
+                "sparkline": _sparkline(conn, appid, points),
+            }
+            for appid in appids
+        }
 
 
 def search_games(query, limit=20):
     conn = get_connection()
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT g.appid, g.name, g.thumbnail_url,
                pc.current_players
         FROM games g
-        LEFT JOIN (
-            SELECT appid, current_players,
-                   ROW_NUMBER() OVER (PARTITION BY appid ORDER BY timestamp DESC) as rn
-            FROM player_counts
-        ) pc ON g.appid = pc.appid AND pc.rn = 1
+        LEFT JOIN player_counts pc ON pc.id = {_LATEST_SAMPLE_ID}
         WHERE g.name LIKE ?
-        ORDER BY pc.current_players DESC
+        ORDER BY pc.current_players DESC, g.appid
         LIMIT ?
     """, (f"%{query}%", limit)).fetchall()
     conn.close()
@@ -210,13 +238,10 @@ def search_games(query, limit=20):
 
 def get_total_players():
     conn = get_connection()
-    row = conn.execute("""
-        SELECT SUM(current_players) as total
-        FROM (
-            SELECT appid, current_players,
-                   ROW_NUMBER() OVER (PARTITION BY appid ORDER BY timestamp DESC) as rn
-            FROM player_counts
-        ) WHERE rn = 1
+    row = conn.execute(f"""
+        SELECT SUM(pc.current_players) as total
+        FROM games g
+        JOIN player_counts pc ON pc.id = {_LATEST_SAMPLE_ID}
     """).fetchone()
     conn.close()
     return row["total"] if row and row["total"] else 0

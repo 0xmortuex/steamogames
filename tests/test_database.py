@@ -24,6 +24,24 @@ def test_top_games_respects_limit(ago):
     assert [g["appid"] for g in db.get_top_games(limit=2)] == [5, 4]
 
 
+def test_top_games_lists_each_game_once_when_sample_timestamps_tie(ago):
+    same_moment = ago(minutes=5)
+    add_game(10, "Game", [(100, same_moment), (120, same_moment)])
+
+    top = db.get_top_games()
+
+    assert [(g["appid"], g["current_players"]) for g in top] == [(10, 120)]
+    assert db.get_total_players() == 120
+
+
+def test_top_games_with_equal_counts_are_ordered_by_appid(ago):
+    add_game(30, "C", [(5, ago(minutes=1))])
+    add_game(10, "A", [(5, ago(minutes=1))])
+    add_game(20, "B", [(5, ago(minutes=1))])
+
+    assert [g["appid"] for g in db.get_top_games()] == [10, 20, 30]
+
+
 def test_games_without_samples_are_not_listed():
     db.upsert_game(10, "Never scraped")
 
@@ -110,6 +128,31 @@ def test_yesterday_count_is_none_without_data_in_window(ago):
     add_game(10, "Game", [(100, ago(hours=1))])
 
     assert db.get_player_count_yesterday(10) is None
+
+
+def test_trend_data_matches_the_single_game_helpers(ago):
+    add_game(10, "A", [(100, ago(hours=23)), (150, ago(minutes=5))])
+    add_game(20, "B", [(7, ago(minutes=5))])
+
+    trend_data = db.get_trend_data([10, 20, 999])
+
+    assert trend_data == {
+        10: {"yesterday": 100, "sparkline": [100, 150]},
+        20: {"yesterday": None, "sparkline": [7]},
+        999: {"yesterday": None, "sparkline": []},
+    }
+    for appid in (10, 20):
+        assert trend_data[appid]["yesterday"] == db.get_player_count_yesterday(appid)
+        assert trend_data[appid]["sparkline"] == db.get_sparkline_data(appid)
+
+
+def test_search_lists_games_without_samples_last(ago):
+    db.upsert_game(10, "Portal")
+    add_game(20, "Portal 2", [(800, ago(minutes=1))])
+
+    results = db.search_games("portal")
+
+    assert [(r["appid"], r["current_players"]) for r in results] == [(20, 800), (10, None)]
 
 
 def test_search_matches_substring_case_insensitively(ago):

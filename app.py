@@ -42,14 +42,15 @@ def api_top():
     games = db.get_top_games(limit)
 
     # Attach trend and sparkline data
+    trend_data = db.get_trend_data([game["appid"] for game in games])
     for game in games:
-        yesterday = db.get_player_count_yesterday(game["appid"])
+        yesterday = trend_data[game["appid"]]["yesterday"]
         current = game.get("current_players", 0)
         if yesterday and yesterday > 0:
             game["trend"] = round(((current - yesterday) / yesterday) * 100, 1)
         else:
             game["trend"] = None
-        game["sparkline"] = db.get_sparkline_data(game["appid"])
+        game["sparkline"] = trend_data[game["appid"]]["sparkline"]
 
     return jsonify({
         "games": games,
